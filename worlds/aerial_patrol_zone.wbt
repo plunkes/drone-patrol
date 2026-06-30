@@ -1,0 +1,10 @@
+#VRML_SIM R2025a utf8
+WorldInfo {
+}
+Viewpoint {
+}
+Background {
+  skyColor [
+    0.4 0.7 1
+  ]
+}
