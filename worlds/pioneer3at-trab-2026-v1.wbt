@@ -1,13 +1,12 @@
-#VRML_SIM R2023b utf8
+#VRML_SIM R2025a utf8
 
 EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2023a/projects/objects/backgrounds/protos/TexturedBackground.proto"
 EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2023a/projects/objects/backgrounds/protos/TexturedBackgroundLight.proto"
 EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2023a/projects/objects/floors/protos/RectangleArena.proto"
 EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2023a/projects/appearances/protos/SandyGround.proto"
-EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2023a/projects/robots/adept/pioneer3/protos/Pioneer3at.proto"
-EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2023a/projects/devices/sick/protos/SickLms291.proto"
 EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2023a/projects/objects/panels/protos/Panel.proto"
 EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2023b/projects/humans/pedestrian/protos/Pedestrian.proto"
+EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2025a/projects/robots/dji/mavic/protos/Mavic2Pro.proto"
 
 WorldInfo {
   info [
@@ -19,9 +18,8 @@ WorldInfo {
   lineScale 0.5
 }
 Viewpoint {
-  orientation 0.15556385096275516 -0.4787039687823852 -0.8640847172272119 5.563743209616172
-  position -23.461994891665494 -34.526191297339544 12.516925801760197
-  follow "Pioneer 3-AT"
+  orientation 0.2244631023796584 -0.2365416495288756 -0.945338227148494 4.708589447682461
+  position -14.554280092702356 -79.20342622361879 49.653949497277836
   followSmoothness 0
 }
 TexturedBackground {
@@ -29,6 +27,7 @@ TexturedBackground {
 TexturedBackgroundLight {
 }
 DEF _88 RectangleArena {
+  translation 3.17256 1.76315 9.99201e-15
   floorSize 60 60
   floorTileSize 3 3
   floorAppearance SandyGround {
@@ -48,7 +47,7 @@ DEF _88 RectangleArena {
     }
   }
 }
-Pedestrian {
+DEF PEDESTRIAN Pedestrian {
   translation 5.77576 3.58949 1.27
   rotation 0 0 -1 1.5708
   controllerArgs [
@@ -139,39 +138,7 @@ Panel {
   name "panel(3)"
   size 0.05 20 1.5
 }
-DEF PIONEER_3AT Pioneer3at {
-  hidden linearVelocity_0 -1.1340368353969636e-15 -3.358897657329804e-15 5.1675835328007286e-17
-  hidden angularVelocity_0 2.7283780844743933e-15 -1.8206132326719125e-15 -7.488128204495177e-17
-  hidden translation_3 -0.1331 0.197 0.11
-  hidden rotation_3 0.6985097810151244 -0.6985030926555988 -0.15549120675062927 2.83308854205996
-  hidden linearVelocity_3 -1.0432308782538034e-15 2.2448230811141126e-16 -7.815859158037072e-16
-  hidden angularVelocity_3 1.0271458204458911e-15 -9.552918989422124e-15 -7.381227426113027e-16
-  hidden translation_4 -0.1331 -0.197 0.11
-  hidden rotation_4 0.6985098096776358 -0.6985031213169371 -0.15549094923695403 2.833089044924804
-  hidden linearVelocity_4 -9.435366562981828e-16 -2.001266451651979e-17 3.5526851629081993e-16
-  hidden angularVelocity_4 -2.575283083597238e-15 -8.187363792341447e-15 -1.1154082668281597e-15
-  hidden translation_5 0.1331 0.197 0.11
-  hidden rotation_5 0.6985107845827773 -0.6985040961821802 -0.15548219009992176 2.8331061495236503
-  hidden linearVelocity_5 -9.994614922682297e-16 7.801581066026975e-16 -2.842092782645697e-16
-  hidden angularVelocity_5 -8.337650919882178e-15 -8.159189908016722e-15 6.128114413190038e-16
-  hidden translation_6 0.1331 -0.197 0.11
-  hidden rotation_6 0.6985107882189096 -0.6985040998181641 -0.15548215742976465 2.833106213321107
-  hidden linearVelocity_6 -1.0701440681837723e-15 -3.6578041280200886e-16 3.5527165383824464e-16
-  hidden angularVelocity_6 1.067425516894934e-15 -9.927546021783974e-15 4.2982197601798357e-16
-  translation 7.306138331233765 -2.151642840713019 -0.002388931069032707
-  rotation 2.0847712489410148e-05 0.00026299949197810277 -0.9999999651983194 0.18669386325829435
-  controller "pioneer3at_obstacle_avoidance_with_lidar"
-  extensionSlot [
-    GPS {
-      translation 0 0 0.3
-      accuracy 0.1
-    }
-    SickLms291 {
-      translation 0.136 0 0.35
-    }
-  ]
-}
-DEF Box01 Shape {
+DEF RED_CUBE Shape {
   appearance Appearance {
     material Material {
       diffuseColor 1 0 0
@@ -180,4 +147,9 @@ DEF Box01 Shape {
   geometry Box {
     size 0.5 0.5 0.5
   }
+}
+Mavic2Pro {
+  translation -22.89 0 0.065
+  controller "drone_patrol"
+  supervisor TRUE
 }
