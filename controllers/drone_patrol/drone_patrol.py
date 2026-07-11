@@ -1,41 +1,29 @@
-"""
-Controlador do Drone Mavic 2 Pro - Sistema de Vigilancia Autonomo (SSC0714)
-===========================================================================
-Arquitetura modular (diretriz do trabalho):
-
-    PID              -> Etapa 1: estabilizacao de voo (Kp, Ki, Kd)
-    VisionDetector   -> Etapa 2: deteccao de intrusos por Visao Computacional
-    TrajectoryLogger -> Etapa 3: gravacao da trajetoria em .txt
-    KeyboardListener -> Etapa 3: tecla 'F' encerra e salva
-    VigilanceDrone   -> orquestra tudo
-
-NAO usa Supervisor (Etapa 2): a deteccao e feita processando a imagem da
-camera do proprio drone, nao lendo posicoes do Scene Tree.
-
-Comportamento inicial (Etapa 1): HOVER estavel na posicao de decolagem.
-"""
-
 from controller import Robot
 import math
+import json
+import socket
 
-# ===============================================================
-# CONFIGURACOES GERAIS
-# ===============================================================
+
 TARGET_ALTITUDE = 2.0          # setpoint de altitude para o hover (m)
 
-# --- Constantes do controlador PADRAO do Mavic 2 Pro (Webots) ---
-# Valores identicos ao mavic2pro.py oficial -> hover comprovadamente estavel.
+# Constantes de controle (padrao Mavic 2 Pro, achadas empiricamente).
+# Logica P + amortecimento por gyro; vertical usa funcao cubica.
 K_VERTICAL_THRUST = 68.5       # empuxo base que sustenta o drone no ar
 K_VERTICAL_OFFSET = 0.6        # bias no alvo de altitude (compensa o "sag")
+K_VERTICAL_P = 3.0             # ganho P da altitude
+K_VERTICAL_D = 5.0             # amortece a taxa de subida (mata overshoot)
+K_ROLL_P = 50.0               # ganho P do roll
+K_PITCH_P = 30.0              # ganho P do pitch
 
-# --- NAVEGACAO / TRAJETORIA ---
+# Trava de proa (yaw). Sem isso o drone gira/deriva sozinho no hover.
+K_YAW_HOLD_P = 3.0            # erro de proa -> torque de correcao
+K_YAW_HOLD_D = 1.5           # amortece a rotacao (yaw rate)
+
 # MODE "HOVER"  -> paira parado na posicao de decolagem
 # MODE "PATROL" -> percorre a lista WAYPOINTS em loop
 MODE = "PATROL"
 
-# Rota (x, y) em coordenadas do mundo. Arena 60x60 centrada em (3.17,1.76)
-# -> x uteis ~[-27, 33]. Drone decola em (-22.89, 0). Retangulo a esquerda,
-# longe dos paineis internos (x~10). Veja no README como pegar mais pontos.
+# Rota (x, y) em coordenadas do mundo.
 WAYPOINTS = [
     (-22.0,  -22.0),
     (5.0, -22.0),
@@ -43,31 +31,29 @@ WAYPOINTS = [
 ]
 WAYPOINT_TOLERANCE = 0.6       # dist (m) para considerar o waypoint alcancado
 
-# Ganhos de deslocamento horizontal (inclina o drone p/ ir ao waypoint)
-K_FORWARD_P = 0.05              # dist -> inclinacao de pitch (avanco)
-MAX_PITCH_DISTURBANCE = 1.0    # limite de nose-down (evita mergulho)
-MAX_YAW_DISTURBANCE = 0.4      # limite de giro por passo
+# Controle de posicao horizontal (PD).  Sem isto o drone so nivela a
+# atitude e desliza para sempre com a velocidade residual da subida.
+# Segura o ponto de decolagem em HOVER e persegue o waypoint em PATROL.
+K_POS_P = 0.4                 # erro de posicao (m) -> inclinacao
+K_VEL_D = 1.5                 # amortece a velocidade horizontal (mata o glide)
+MAX_POS_ERROR = 3.0          # satura o erro de posicao (evita tilt extremo)
+MAX_TILT_DISTURBANCE = 1.0    # limite de inclinacao por eixo (roll/pitch)
+MAX_YAW_DISTURBANCE = 1.3      # limite de giro por passo
 
-LOG_FILE_PATH = "log_trajetoria.txt"
+# Log de trajetoria na raiz do projeto (junto do telem.csv).
+# CWD do controlador = controllers/drone_patrol -> sobe 2 niveis.
+LOG_FILE_PATH = "../../log_trajetoria.txt"
 
-# --- Etapa 2: limiares de Visao Computacional ---
+# Telemetria ao vivo: envia estado por UDP p/ o plotter (drone_plot.py).
+# Fire-and-forget: se ninguem escuta, nao trava a simulacao.
+TELEMETRY_ENABLE = True
+TELEMETRY_HOST = "127.0.0.1"
+TELEMETRY_PORT = 5005
+
 # Blob e "detectado" se area (nº de pixels da cor) > MIN_BLOB_AREA.
 MIN_BLOB_AREA = 40
 VISION_STRIDE = 2              # amostra 1 a cada N pixels (performance)
 ALERT_COOLDOWN = 3.0           # s entre alertas repetidos do mesmo alvo
-
-# ===============================================================
-# GANHOS PID  (base = controlador padrao do Mavic 2 Pro)
-#   Formato dos logs: [Setpoint | Atual | Erro | Saida]
-#   Ki=0 -> o controlador oficial nao usa termo integral.
-#   Kd nos eixos de atitude = 1.0 -> a "velocidade" do giroscopio e a
-#   propria derivada do angulo (amortecimento). Nao mexa nisso ainda.
-# ===============================================================
-#                    Kp     Ki     Kd
-GAINS_ALTITUDE  = (   1.5,  0.3,   2.0 )   # k_vertical_p do padrao
-GAINS_ROLL      = (  50.0,  1.0,   3.0 )   # k_roll_p  + amortecimento gyro
-GAINS_PITCH     = (  30.0,  1.0,   3.0 )   # k_pitch_p + amortecimento gyro
-GAINS_YAW       = (   2.0,  0.1,   3.0 )   # trava a proa inicial
 
 
 def clamp(value, low, high):
@@ -83,78 +69,10 @@ def normalize_angle(angle):
     return angle
 
 
-# ===============================================================
-# MODULO 1 - CONTROLE (PID)
-# ===============================================================
-class PID:
-    """Controlador PID generico com anti-windup e saturacao de saida.
-
-    Guarda o ultimo calculo (setpoint, medida, erro, saida) para os logs
-    de debug exigidos na Etapa 1.
-    """
-
-    def __init__(self, kp, ki, kd, name="",
-                 out_limits=(-float("inf"), float("inf")),
-                 integral_limit=10.0):
-        self.kp, self.ki, self.kd = kp, ki, kd
-        self.name = name
-        self.out_min, self.out_max = out_limits
-        self.integral_limit = integral_limit      # anti-windup (satura I)
-        self.reset()
-
-    def reset(self):
-        self._integral = 0.0
-        self._prev_error = 0.0
-        self._first = True
-        # snapshot p/ debug: setpoint, valor atual, erro, saida
-        self.debug = (0.0, 0.0, 0.0, 0.0)
-
-    def update(self, setpoint, measured, dt, derivative=None, error_clamp=None):
-        # (P) erro instantaneo entre onde queremos e onde estamos
-        error = setpoint - measured
-        # opcional: satura o erro (o padrao do Mavic limita o erro de
-        # altitude a [-1,1] antes de aplicar o ganho vertical)
-        if error_clamp is not None:
-            error = clamp(error, -error_clamp, error_clamp)
-
-        # (I) acumula o erro no tempo para eliminar erro de regime.
-        # O clamp abaixo e o anti-windup: impede o termo integral de
-        # crescer sem limite enquanto o drone ainda nao chegou no alvo.
-        self._integral += error * dt
-        self._integral = clamp(self._integral,
-                               -self.integral_limit, self.integral_limit)
-
-        # (D) taxa de variacao do erro -> amortece oscilacao/overshoot.
-        # Se 'derivative' for passado (ex.: velocidade do giroscopio), usa-o
-        # direto -> reproduz o "+ *_velocity" do controlador oficial e evita
-        # ruido de derivada numerica. Senao, calcula d(erro)/dt.
-        if derivative is not None:
-            deriv = derivative
-        else:
-            deriv = 0.0 if self._first else (error - self._prev_error) / dt
-        self._first = False
-        self._prev_error = error
-
-        # Saida = soma ponderada dos tres termos (linha critica do PID)
-        output = self.kp * error + self.ki * self._integral + self.kd * deriv
-        output = clamp(output, self.out_min, self.out_max)
-
-        self.debug = (setpoint, measured, error, output)
-        return output
-
-    def log(self):
-        sp, val, err, out = self.debug
-        print(f"[PID {self.name:>4}] Setpoint={sp:+.3f} | Atual={val:+.3f} | "
-              f"Erro={err:+.3f} | Saida={out:+.3f}")
-
-
-# ===============================================================
-# MODULO 2 - VISAO COMPUTACIONAL
-# ===============================================================
 class VisionDetector:
     """Detecta intrusos processando o buffer BGRA da camera.
 
-    Sem Supervisor: apenas pixels. Procura dois alvos por cor:
+    Procura dois alvos por cor:
         - vermelho (cubo/objeto de interesse)
         - verde    (calca do pedestre = intruso)
     Retorna area do blob e centroide (u, v) de cada cor.
@@ -212,9 +130,6 @@ class VisionDetector:
         return result
 
 
-# ===============================================================
-# MODULO 3 - I/O (LOG EM ARQUIVO + TECLADO)
-# ===============================================================
 class TrajectoryLogger:
     """Grava a trajetoria no formato:  <x> <y> <z>  (uma linha por passo)."""
 
@@ -230,6 +145,34 @@ class TrajectoryLogger:
             self._f.flush()
             self._f.close()
             print(f"[I/O] Log salvo em '{self.path}'.")
+
+
+class Telemetry:
+    """Envia o estado de controle por UDP (JSON) p/ um plotter externo.
+
+    UDP nao-bloqueante: se o plotter nao estiver rodando, os pacotes sao
+    descartados sem travar a simulacao."""
+
+    def __init__(self, host, port, enable=True):
+        self.enable = enable
+        self.addr = (host, port)
+        self.sock = None
+        if enable:
+            self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self.sock.setblocking(False)
+            print(f"[TELEMETRY] Enviando UDP p/ {host}:{port}")
+
+    def send(self, data):
+        if not self.enable:
+            return
+        try:
+            self.sock.sendto(json.dumps(data).encode("utf-8"), self.addr)
+        except OSError:
+            pass    # buffer cheio / sem rota -> ignora, nao trava o loop
+
+    def close(self):
+        if self.sock:
+            self.sock.close()
 
 
 class KeyboardListener:
@@ -248,12 +191,10 @@ class KeyboardListener:
         return False
 
 
-# ===============================================================
-# MODULO 4 - ORQUESTRACAO DO DRONE
-# ===============================================================
+
 class VigilanceDrone:
     def __init__(self):
-        self.robot = Robot()                                  # <- NAO Supervisor
+        self.robot = Robot()                                  
         self.timestep = int(self.robot.getBasicTimeStep())
         self.dt = self.timestep / 1000.0
 
@@ -276,11 +217,6 @@ class VigilanceDrone:
             m.setVelocity(1.0)
 
         # --- modulos ---
-        self.pid_alt   = PID(*GAINS_ALTITUDE, name="ALT")
-        self.pid_roll  = PID(*GAINS_ROLL,     name="ROLL")
-        self.pid_pitch = PID(*GAINS_PITCH,    name="PTCH")
-        self.pid_yaw   = PID(*GAINS_YAW,      name="YAW")
-
         self.vision = VisionDetector(self.camera)
         self.logger = TrajectoryLogger(LOG_FILE_PATH)
         self.keys = KeyboardListener(self.robot, self.timestep)
@@ -289,6 +225,12 @@ class VigilanceDrone:
         self.last_alert = {"red": -1e9, "green": -1e9}
         self.sim_time = 0.0
         self.waypoint_index = 0         # waypoint atual da rota (modo PATROL)
+        self.prev_alt = None            # altitude anterior (p/ estimar vz)
+        self.prev_xy = None             # (x,y) anterior (p/ estimar vx,vy)
+        self.hover_xy = None            # ponto de decolagem travado (HOVER)
+        self.debug_inputs = (0.0, 0.0, 0.0, 0.0)  # roll/pitch/yaw/vert p/ log
+        self.telemetry = Telemetry(TELEMETRY_HOST, TELEMETRY_PORT,
+                                   enable=TELEMETRY_ENABLE)
 
     # -----------------------------------------------------------
     def compute_motor_commands(self, target=None):
@@ -299,46 +241,68 @@ class VigilanceDrone:
         target=(tx,ty) -> gira para encarar o ponto e avanca ate ele.
         Retorna a distancia horizontal ate o alvo (0.0 em hover)."""
         roll, pitch, yaw = self.imu.getRollPitchYaw()
-        roll_rate, pitch_rate, _ = self.gyro.getValues()
+        roll_rate, pitch_rate, yaw_rate = self.gyro.getValues()
         x, y, altitude = self.gps.getValues()
+
+        # velocidades por diferenca finita (p/ amortecer altitude e posicao)
+        vz = 0.0 if self.prev_alt is None else (altitude - self.prev_alt) / self.dt
+        if self.prev_xy is None:
+            vx = vy = 0.0
+        else:
+            vx = (x - self.prev_xy[0]) / self.dt
+            vy = (y - self.prev_xy[1]) / self.dt
+        self.prev_alt = altitude
+        self.prev_xy = (x, y)
 
         if self.target_yaw is None:
             self.target_yaw = yaw       # trava a proa inicial como setpoint
+        if self.hover_xy is None:
+            self.hover_xy = (x, y)      # trava o ponto de decolagem
 
-        # --- direcao/distancia ate o waypoint (navegacao) ---
-        distance = 0.0
-        pitch_disturbance = 0.0
+        # --- alvo de posicao e de proa ---
+        # HOVER: segura o ponto de decolagem, mantem a proa inicial.
+        # PATROL: persegue o waypoint e encara-o.
         if target is None:
-            desired_yaw = self.target_yaw          # hover: mantem a proa
+            hold_x, hold_y = self.hover_xy
+            desired_yaw = self.target_yaw
         else:
-            tx, ty = target
-            dx, dy = tx - x, ty - y
-            distance = math.hypot(dx, dy)
-            desired_yaw = math.atan2(dy, dx)       # aponta o nariz p/ o alvo
-            yaw_err_nav = normalize_angle(desired_yaw - yaw)
-            # so avanca quando ja esta razoavelmente alinhado (cos>0);
-            # nose-down proporcional a distancia -> voa para frente
-            alignment = max(0.0, math.cos(yaw_err_nav))
-            pitch_disturbance = -clamp(K_FORWARD_P * distance * alignment,
-                                       0.0, MAX_PITCH_DISTURBANCE)
+            hold_x, hold_y = target
+            desired_yaw = math.atan2(hold_y - y, hold_x - x)
+        distance = math.hypot(hold_x - x, hold_y - y)
 
-        # --- PID de atitude (setpoint = nivelado, 0 rad) ---
-        # O PID leva o angulo a zero: saida = Kp*(0-ang) + Kd*(-rate).
-        # Negamos para obter o "*_input" no mesmo sinal do controlador
-        # padrao ( = Kp*ang + rate ), usado na mixagem abaixo.
-        roll_input  = -self.pid_roll.update(0.0, roll, self.dt, derivative=-roll_rate)
-        pitch_input = -self.pid_pitch.update(0.0, pitch, self.dt, derivative=-pitch_rate)
-        pitch_input += pitch_disturbance           # comando de avanco
+        # --- controle de posicao horizontal (PD em coords do corpo) ---
+        # Projeta erro de posicao e velocidade nos eixos frente/esquerda
+        # do drone (girados pelo yaw) e gera as inclinacoes de correcao.
+        c, s = math.cos(yaw), math.sin(yaw)
+        dpx, dpy = hold_x - x, hold_y - y
+        e_fwd  = clamp(dpx * c + dpy * s, -MAX_POS_ERROR, MAX_POS_ERROR)
+        e_left = clamp(-dpx * s + dpy * c, -MAX_POS_ERROR, MAX_POS_ERROR)
+        v_fwd  = vx * c + vy * s
+        v_left = -vx * s + vy * c
+        # aceleracao desejada = P*erro - D*velocidade (freia o glide)
+        a_fwd  = K_POS_P * e_fwd  - K_VEL_D * v_fwd
+        a_left = K_POS_P * e_left - K_VEL_D * v_left
+        # frente = pitch negativo; esquerda = roll positivo (conv. Mavic)
+        pitch_disturbance = -clamp(a_fwd, -MAX_TILT_DISTURBANCE, MAX_TILT_DISTURBANCE)
+        roll_disturbance  =  clamp(a_left, -MAX_TILT_DISTURBANCE, MAX_TILT_DISTURBANCE)
 
-        # --- PID de yaw: encara o alvo (ou trava a proa em hover) ---
-        yaw_err = normalize_angle(desired_yaw - yaw)   # trata o wrap +/-pi
-        yaw_input = clamp(self.pid_yaw.update(0.0, -yaw_err, self.dt),
+        # --- controle de atitude (P + amortecimento por gyro) ---
+        # Formula padrao Mavic: Kp*angulo + taxa_angular + disturbio.
+        # angulo saturado em +-1 rad para limitar a autoridade.
+        roll_input = K_ROLL_P * clamp(roll, -1.0, 1.0) + roll_rate + roll_disturbance
+        pitch_input = K_PITCH_P * clamp(pitch, -1.0, 1.0) + pitch_rate + pitch_disturbance
+
+        # --- trava de proa (P sobre o erro de yaw + D sobre yaw_rate) ---
+        # Sem isso o drone deriva/gira; D amortece a oscilacao de yaw.
+        yaw_err = normalize_angle(desired_yaw - yaw)
+        yaw_input = clamp(K_YAW_HOLD_P * yaw_err - K_YAW_HOLD_D * yaw_rate,
                           -MAX_YAW_DISTURBANCE, MAX_YAW_DISTURBANCE)
 
-        # --- PID de altitude: incremento de empuxo (erro saturado em +-1
-        #     como no padrao; offset compensa a perda de sustentacao) ---
-        vertical_input = self.pid_alt.update(
-            TARGET_ALTITUDE + K_VERTICAL_OFFSET, altitude, self.dt, error_clamp=1.0)
+        # --- altitude: funcao cubica do erro saturado + amortecimento da
+        #     taxa de subida (mata o overshoot/oscilacao na subida) ---
+        clamped_diff_alt = clamp(TARGET_ALTITUDE - altitude + K_VERTICAL_OFFSET,
+                                 -1.0, 1.0)
+        vertical_input = K_VERTICAL_P * (clamped_diff_alt ** 3) - K_VERTICAL_D * vz
 
         base = K_VERTICAL_THRUST + vertical_input    # empuxo comum aos 4 motores
 
@@ -355,9 +319,24 @@ class VigilanceDrone:
         self.motors[3].setVelocity(rr)
 
         # gimbal compensa a inclinacao para manter a imagem estavel
-        rr_, pr_, _ = self.gyro.getValues()
-        self.cam_roll.setPosition(-0.115 * rr_)
-        self.cam_pitch.setPosition(-0.1 * pr_)
+        self.cam_roll.setPosition(-0.115 * roll_rate)
+        self.cam_pitch.setPosition(-0.1 * pitch_rate)
+
+        self.debug_inputs = (roll_input, pitch_input, yaw_input, vertical_input)
+        # snapshot completo p/ telemetria/plotter
+        self.telemetry.send({
+            "t": round(self.sim_time, 3),
+            "altitude": altitude, "target_altitude": TARGET_ALTITUDE, "vz": vz,
+            "roll": roll, "pitch": pitch, "yaw": yaw,
+            "yaw_err": yaw_err, "desired_yaw": desired_yaw,
+            "roll_rate": roll_rate, "pitch_rate": pitch_rate, "yaw_rate": yaw_rate,
+            "roll_input": roll_input, "pitch_input": pitch_input,
+            "yaw_input": yaw_input, "vertical_input": vertical_input,
+            "x": x, "y": y, "distance": distance,
+            "vx": vx, "vy": vy, "v_fwd": v_fwd, "v_left": v_left,
+            "pitch_dist": pitch_disturbance, "roll_dist": roll_disturbance,
+            "fl": fl, "fr": fr, "rl": rl, "rr": rr,
+        })
 
         return distance
 
@@ -407,12 +386,12 @@ class VigilanceDrone:
             else:
                 self.compute_motor_commands()          # hover
 
-            # --- Etapa 1: debug dos PIDs no console ---
+            # --- Etapa 1: debug do controle no console ---
             if step % log_every == 0:
-                self.pid_alt.log()
-                self.pid_roll.log()
-                self.pid_pitch.log()
-                self.pid_yaw.log()
+                ri, pi, yi, vi = self.debug_inputs
+                _, _, alt = self.gps.getValues()
+                print(f"[CTRL] alt={alt:+.2f} | roll_in={ri:+.2f} | "
+                      f"pitch_in={pi:+.2f} | yaw_in={yi:+.2f} | vert_in={vi:+.2f}")
 
             # --- Etapa 2: visao ---
             self.run_vision()
@@ -429,6 +408,7 @@ class VigilanceDrone:
         # fecha o arquivo com seguranca (flush + close).
         # Ao retornar de run(), o controlador termina e a simulacao para.
         self.logger.close()
+        self.telemetry.close()
 
 
 if __name__ == "__main__":
