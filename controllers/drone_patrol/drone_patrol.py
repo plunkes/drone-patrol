@@ -90,9 +90,9 @@ MAX_YAW_DISTURBANCE = 1.3      # limite de giro por passo
 # Empurra o drone para longe de qualquer obstaculo dentro de REACT_RANGE,
 # mantendo pelo menos SAFE_DISTANCE de folga.
 SENSOR_COUNT = 8
-REACT_RANGE = 2.0            # m: comeca a repelir abaixo disto
-SAFE_DISTANCE = 0.5          # m: folga minima desejada de qualquer parede
-K_REPULSION = 2.0           # ganho da repulsao (forte perto de SAFE_DISTANCE)
+REACT_RANGE = 0.6            # m: comeca a repelir abaixo disto
+SAFE_DISTANCE = 0.3          # m: folga minima desejada de qualquer parede
+K_REPULSION = 1.0           # ganho da repulsao (forte perto de SAFE_DISTANCE)
 REACT_MIN_ALT = 1.0         # m: so liga o desvio reativo acima desta altitude
 
 # Log de trajetoria na raiz do projeto (junto do telem.csv).
