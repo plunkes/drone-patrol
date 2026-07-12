@@ -44,19 +44,32 @@ SUBWP_TOLERANCE = 1.0          # dist (m) p/ avancar entre pontos do caminho A*
 
 # Mapa de obstaculos CONHECIDOS (nao inclui anomalias: cubos/pessoas).
 # Deve refletir o mundo. rects = (xmin,xmax,ymin,ymax); circles = (cx,cy,r).
-GRID_BOUNDS = (-16.0, 36.0, -14.0, 34.0)   # (xmin,xmax,ymin,ymax) do grid
+GRID_BOUNDS = (-20.0, 40.0, -18.0, 38.0)   # (xmin,xmax,ymin,ymax) do grid
 GRID_CELL = 1.0                            # tamanho da celula (m)
 OBSTACLE_INFLATE = 0.8                     # folga: raio do drone + margem
 STATIC_RECTS = [
     (-0.3, 20.3, -0.3, 14.3),   # edificio (preenchido)
     (22.0, 30.0, 4.0, 12.0),    # anexo
-    (23.0, 25.0, -7.0, -5.0),   # caixote
+    (23.0, 25.0, -7.0, -5.0),   # caixote (box_1)
+    (1.0, 3.0, -11.0, -9.0),    # box_2
+    (11.0, 13.0, 26.0, 28.0),   # box_3
+    (26.0, 28.0, 24.0, 26.0),   # box_4
+    (-16.0, -14.0, 12.0, 14.0),  # box_5
+    (20.0, 22.0, -12.0, -10.0),  # box_6
 ]
 STATIC_CIRCLES = [
     (16.0, -6.0, 0.5),          # arvore 1
     (32.0, 12.0, 0.6),          # arvore 2
     (-4.0, 20.0, 0.5),          # arvore 3
     (6.0, 30.0, 0.5),           # arvore 4
+    (0.0, -6.0, 0.6),           # arvore 5
+    (-9.0, 6.0, 0.5),           # arvore 6
+    (-9.0, 26.0, 0.6),          # arvore 7
+    (14.0, 22.0, 0.5),          # arvore 8
+    (28.0, -2.0, 0.5),          # arvore 9
+    (2.0, 20.0, 0.6),           # arvore 10
+    (18.0, 30.0, 0.5),          # arvore 11
+    (-12.0, 10.0, 0.5),         # arvore 12
 ]
 
 # Parada + reorientacao em cada waypoint (freia -> gira p/ o proximo -> segue)
@@ -107,6 +120,18 @@ FOLLOW_APPROACH = 2.0         # m a frente: alvo de aproximacao no follow
 REGISTER_PERIOD = 1.0        # s entre registros continuos (follow)
 REGISTER_NOMINAL_RANGE = 3.0  # m: standoff estimado quando nao ha profundidade
 ANOMALY_LOG_PATH = "../../anomalias.txt"
+
+# APPROACH: ao detectar, aproxima ate <= APPROACH_RANGE antes de registrar.
+APPROACH_RANGE = 10.0         # m: distancia maxima p/ registrar a anomalia
+APPROACH_TIMEOUT = 25.0       # s max tentando aproximar
+APPROACH_LOST_TIMEOUT = 3.0   # s sem ver o alvo -> desiste
+
+# Camera apontada p/ baixo (rad). Sem isto a camera olha no horizonte e nao
+# enxerga anomalias no chao. Tambem e o angulo usado na telemetria de alcance.
+CAM_PITCH_DOWN = 0.35         # ~20 deg abaixo da horizontal
+
+# Altura assumida do alvo (m) p/ estimar alcance pelo plano do chao.
+TARGET_HEIGHT = {"red": 0.25, "green": 0.9}
 
 # Deteccao de cor em HSV (robusta a sombra/contraluz).  O matiz (hue) se
 # mantem sob variacao de luz; satura/valor rejeitam cinza e preto.
@@ -511,6 +536,7 @@ class VigilanceDrone:
             m.setVelocity(1.0)
 
         self.cam_width = self.camera.getWidth()
+        self.cam_height = self.camera.getHeight()
         self.cam_fov = self.camera.getFov()   # FOV horizontal (rad)
 
         # --- modulos ---
@@ -544,6 +570,7 @@ class VigilanceDrone:
         self.anomaly_cooldown = {"red": -1e9, "green": -1e9}
         self.state_start = 0.0          # inicio do estado INSPECT/FOLLOW
         self.inspect_anchor = None      # posicao travada durante o INSPECT
+        self.approach_kind = None       # tipo de anomalia sendo aproximada
         self.last_register = 0.0        # ultimo registro continuo (FOLLOW)
         self.last_seen = 0.0            # ultima vez que viu a pessoa (FOLLOW)
 
@@ -665,7 +692,9 @@ class VigilanceDrone:
 
         # gimbal compensa a inclinacao para manter a imagem estavel
         self.cam_roll.setPosition(-0.115 * roll_rate)
-        self.cam_pitch.setPosition(-0.1 * pitch_rate)
+        # bias fixo p/ baixo + estabilizacao: sem o bias a camera olha no
+        # horizonte e nunca ve as anomalias no chao.
+        self.cam_pitch.setPosition(CAM_PITCH_DOWN - 0.1 * pitch_rate)
 
         self.debug_inputs = (roll_input, pitch_input, yaw_input, vertical_input)
         self.last_speed = math.hypot(vx, vy)     # p/ a maquina de estados
@@ -744,48 +773,101 @@ class VigilanceDrone:
         b = self._bearing(info, yaw)
         return (x + 50.0 * math.cos(b), y + 50.0 * math.sin(b))
 
-    def _estimate_pos(self, info, x, y, z, yaw):
-        """Posicao estimada do alvo no mundo e range (m).
-        Usa a posicao relativa da Recognition; senao projeta a bearing
-        a um standoff nominal (localizacao so por bearing)."""
-        rel = info.get("rel") if info else None
-        if rel is not None:
-            rx, ry, rz = rel
-            fwd, right = -rz, rx      # camera olha em -z; x = direita
-            wx = x + fwd * math.cos(yaw) + right * math.sin(yaw)
-            wy = y + fwd * math.sin(yaw) - right * math.cos(yaw)
-            return (wx, wy, z + ry), math.hypot(fwd, right)
+    def _range_to_target(self, info, altitude, kind):
+        """Alcance horizontal (m) ao alvo pela HIPOTESE DE PLANO DE CHAO.
+
+        Uma camera unica nao mede profundidade. Mas as anomalias estao no
+        chao, numa altura conhecida (TARGET_HEIGHT). Entao:
+          - a linha do pixel v da o angulo de depressao abaixo da horizontal
+            (bias fixo da camera + deslocamento vertical do pixel);
+          - com a altura do drone acima do alvo, o triangulo fecha:
+                alcance = (z_drone - z_alvo) / tan(depressao)
+        Devolve None se o alvo esta na horizontal ou acima (alcance ~ inf).
+        """
+        vfov = 2.0 * math.atan(math.tan(self.cam_fov / 2.0) *
+                               self.cam_height / self.cam_width)
+        # v cresce p/ baixo na imagem -> angulo positivo = abaixo do eixo
+        ang_v = (info["v"] / self.cam_height - 0.5) * vfov
+        depression = CAM_PITCH_DOWN + ang_v
+        dz = altitude - TARGET_HEIGHT.get(kind, 0.0)
+        if depression <= 0.05 or dz <= 0.1:
+            return None                      # alvo no horizonte -> muito longe
+        return dz / math.tan(depression)
+
+    def _estimate_pos(self, info, x, y, z, yaw, kind):
+        """Posicao estimada do alvo no mundo + alcance (m).
+        Bearing (do pixel u) + alcance (plano de chao) = posicao 2D."""
         b = self._bearing(info, yaw)
-        d = REGISTER_NOMINAL_RANGE
-        return (x + d * math.cos(b), y + d * math.sin(b), 0.0), None
+        rng = self._range_to_target(info, z, kind)
+        d = rng if rng is not None else REGISTER_NOMINAL_RANGE
+        return (x + d * math.cos(b), y + d * math.sin(b),
+                TARGET_HEIGHT.get(kind, 0.0)), rng
 
     # Mission FSM
     def mission_step(self, det):
-        """Despacha PATROL / INSPECT (cubo) / FOLLOW (pessoa)."""
+        """Despacha PATROL -> APPROACH -> INSPECT (cubo) / FOLLOW (pessoa).
+
+        APPROACH e comum aos dois tipos: so vale registrar de perto, entao
+        o drone primeiro chega a <= APPROACH_RANGE do alvo."""
         x, y, z = self.gps.getValues()
         _, _, yaw = self.imu.getRollPitchYaw()
 
         if self.mission == "PATROL":
             trig = self._check_trigger(det)
-            if trig == "green":
-                self.mission = "FOLLOW"
-                self.state_start = self.sim_time
-                self.last_seen = self.sim_time
-                self.last_register = -1e9
-                print("[MISSION] Pessoa detectada -> seguindo.")
-            elif trig == "red":
-                self.mission = "INSPECT"
-                self.state_start = self.sim_time
-                self.inspect_anchor = (x, y)
-                print("[MISSION] Cubo vermelho detectado -> inspecionando.")
-            else:
+            if trig is None:
                 self.patrol_step()
                 return
+            self.mission = "APPROACH"
+            self.approach_kind = trig
+            self.state_start = self.sim_time
+            self.last_seen = self.sim_time
+            label = "Pessoa" if trig == "green" else "Cubo vermelho"
+            print(f"[MISSION] {label} detectado -> aproximando "
+                  f"(ate {APPROACH_RANGE:.0f} m).")
 
-        if self.mission == "INSPECT":
+        if self.mission == "APPROACH":
+            self._approach_step(det, x, y, z, yaw)
+        elif self.mission == "INSPECT":
             self._inspect_step(det, x, y, z, yaw)
         elif self.mission == "FOLLOW":
             self._follow_step(det, x, y, z, yaw)
+
+    def _approach_step(self, det, x, y, z, yaw):
+        """Voa em direcao a anomalia ate ficar a <= APPROACH_RANGE dela.
+        So entao passa p/ INSPECT (cubo) ou FOLLOW (pessoa)."""
+        kind = self.approach_kind
+        info = det.get(kind) if det else None
+        seen = info and info["area"] >= MIN_BLOB_AREA
+
+        if seen:
+            self.last_seen = self.sim_time
+            face = self._bearing_point(info, x, y, yaw)
+            rng = self._range_to_target(info, z, kind)
+            if rng is not None and rng <= APPROACH_RANGE:
+                # chegou perto o bastante -> comportamento por tipo
+                self.state_start = self.sim_time
+                if kind == "red":
+                    self.mission = "INSPECT"
+                    self.inspect_anchor = (x, y)
+                    print(f"[MISSION] A {rng:.1f} m do cubo -> inspecionando.")
+                else:
+                    self.mission = "FOLLOW"
+                    self.last_register = -1e9
+                    print(f"[MISSION] A {rng:.1f} m da pessoa -> seguindo.")
+                self.compute_motor_commands(target=(x, y), face_point=face)
+                return
+            # ainda longe: persegue a posicao estimada do alvo
+            world, _ = self._estimate_pos(info, x, y, z, yaw, kind)
+            self.compute_motor_commands(target=(world[0], world[1]), face_point=face)
+        else:
+            self.compute_motor_commands(target=(x, y))   # perdeu: segura
+
+        elapsed = self.sim_time - self.state_start
+        lost = self.sim_time - self.last_seen > APPROACH_LOST_TIMEOUT
+        if elapsed > APPROACH_TIMEOUT or lost:
+            reason = "perdeu o alvo" if lost else "tempo esgotado"
+            print(f"[MISSION] Aproximacao abortada ({reason}).")
+            self._resume_patrol(kind)
 
     def _check_trigger(self, det):
         """Retorna 'green'/'red' se ha anomalia acima do limiar e fora do
@@ -807,7 +889,7 @@ class VigilanceDrone:
             face = self._bearing_point(info, x, y, yaw)
             self.compute_motor_commands(target=self.inspect_anchor, face_point=face)
             if abs(self.last_yaw_err) < INSPECT_CENTER_TOL:      # centrado
-                world, rng = self._estimate_pos(info, x, y, z, yaw)
+                world, rng = self._estimate_pos(info, x, y, z, yaw, "red")
                 self.anomalies.register(self.sim_time, "red", world, (x, y, z, yaw), rng)
                 self._resume_patrol("red")
                 return
@@ -815,7 +897,7 @@ class VigilanceDrone:
             self.compute_motor_commands(target=self.inspect_anchor)
 
         if self.sim_time - self.state_start > INSPECT_TIMEOUT:
-            world, rng = (self._estimate_pos(info, x, y, z, yaw)
+            world, rng = (self._estimate_pos(info, x, y, z, yaw, "red")
                           if seen else ((x, y, 0.0), None))
             self.anomalies.register(self.sim_time, "red", world, (x, y, z, yaw), rng)
             print("[MISSION] Inspecao esgotou o tempo -> registrando e seguindo.")
@@ -834,7 +916,7 @@ class VigilanceDrone:
             self.compute_motor_commands(target=tgt, face_point=face)
             if self.sim_time - self.last_register >= REGISTER_PERIOD:
                 self.last_register = self.sim_time
-                world, rng = self._estimate_pos(info, x, y, z, yaw)
+                world, rng = self._estimate_pos(info, x, y, z, yaw, "green")
                 self.anomalies.register(self.sim_time, "green", world, (x, y, z, yaw), rng)
         else:
             self.compute_motor_commands(target=(x, y))   # perdeu: segura no lugar
