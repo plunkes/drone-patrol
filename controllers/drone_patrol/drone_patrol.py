@@ -31,6 +31,10 @@ WAYPOINTS = [
     (5.0, 0.0)
 ]
 WAYPOINT_TOLERANCE = 0.6       # dist (m) para considerar o waypoint alcancado
+# Parada + reorientacao em cada waypoint (freia -> gira p/ o proximo -> segue)
+WAYPOINT_ARRIVE_SPEED = 0.25   # m/s abaixo disso = "parado" no waypoint
+WAYPOINT_PAUSE = 1.5           # s de permanencia parado em cada waypoint
+WAYPOINT_YAW_TOL = 0.10        # rad (~6 deg) alinhamento p/ seguir
 
 # Controle de posicao horizontal (PD).  Sem isto o drone so nivela a
 # atitude e desliza para sempre com a velocidade residual da subida.
@@ -243,6 +247,10 @@ class VigilanceDrone:
         self.last_alert = {"red": -1e9, "green": -1e9}
         self.sim_time = 0.0
         self.waypoint_index = 0         # waypoint atual da rota (modo PATROL)
+        self.patrol_state = "CRUISE"    # CRUISE -> PAUSE -> CRUISE
+        self.pause_start = 0.0          # instante em que comecou a parada
+        self.last_speed = 0.0           # |v| horizontal (maquina de estados)
+        self.last_yaw_err = 0.0         # erro de proa atual
         self.prev_alt = None            # altitude anterior (p/ estimar vz)
         self.prev_xy = None             # (x,y) anterior (p/ estimar vx,vy)
         self.hover_xy = None            # ponto de decolagem travado (HOVER)
@@ -251,13 +259,12 @@ class VigilanceDrone:
                                    enable=TELEMETRY_ENABLE)
 
     # -----------------------------------------------------------
-    def compute_motor_commands(self, target=None):
-        """Roda os 4 PIDs e mistura a saida nos quatro motores (mixagem
-        padrao do quadrirotor em X).
+    def compute_motor_commands(self, target=None, face_point=None):
+        """Roda o controle e aciona os 4 motores. Retorna a dist ao alvo.
 
-        target=None  -> hover (proa travada, sem deslocamento).
-        target=(tx,ty) -> gira para encarar o ponto e avanca ate ele.
-        Retorna a distancia horizontal ate o alvo (0.0 em hover)."""
+        target=None      -> segura o ponto de decolagem (hover).
+        target=(tx,ty)   -> vai ate o ponto.
+        face_point=(x,y) -> encara este ponto (senao encara o 'target')."""
         roll, pitch, yaw = self.imu.getRollPitchYaw()
         roll_rate, pitch_rate, yaw_rate = self.gyro.getValues()
         x, y, altitude = self.gps.getValues()
@@ -278,14 +285,15 @@ class VigilanceDrone:
             self.hover_xy = (x, y)      # trava o ponto de decolagem
 
         # --- alvo de posicao e de proa ---
-        # HOVER: segura o ponto de decolagem, mantem a proa inicial.
-        # PATROL: persegue o waypoint e encara-o.
         if target is None:
             hold_x, hold_y = self.hover_xy
             desired_yaw = self.target_yaw
         else:
             hold_x, hold_y = target
             desired_yaw = math.atan2(hold_y - y, hold_x - x)
+        # face_point sobrepoe a proa (usado no reorientar em waypoint)
+        if face_point is not None:
+            desired_yaw = math.atan2(face_point[1] - y, face_point[0] - x)
         distance = math.hypot(hold_x - x, hold_y - y)
 
         # --- controle de posicao horizontal (PD em coords do corpo) ---
@@ -341,6 +349,8 @@ class VigilanceDrone:
         self.cam_pitch.setPosition(-0.1 * pitch_rate)
 
         self.debug_inputs = (roll_input, pitch_input, yaw_input, vertical_input)
+        self.last_speed = math.hypot(vx, vy)     # p/ a maquina de estados
+        self.last_yaw_err = yaw_err
         # snapshot completo p/ telemetria/plotter
         self.telemetry.send({
             "t": round(self.sim_time, 3),
@@ -357,6 +367,33 @@ class VigilanceDrone:
         })
 
         return distance
+
+    # -----------------------------------------------------------
+    def patrol_step(self):
+        """Maquina de estados da patrulha.
+        CRUISE: voa ate o waypoint atual.
+        PAUSE : chegou -> freia, gira para o proximo waypoint e espera
+                (WAYPOINT_PAUSE s alinhado) antes de seguir."""
+        n = len(WAYPOINTS)
+        cur = WAYPOINTS[self.waypoint_index]
+        nxt = WAYPOINTS[(self.waypoint_index + 1) % n]
+
+        if self.patrol_state == "CRUISE":
+            distance = self.compute_motor_commands(cur)
+            arrived = distance < WAYPOINT_TOLERANCE and self.last_speed < WAYPOINT_ARRIVE_SPEED
+            if arrived:
+                self.patrol_state = "PAUSE"
+                self.pause_start = self.sim_time
+                print(f"[NAV] Chegou ao waypoint {self.waypoint_index} {cur} -> parando.")
+        else:  # PAUSE: segura a posicao no waypoint e encara o proximo
+            self.compute_motor_commands(cur, face_point=nxt)
+            waited = self.sim_time - self.pause_start >= WAYPOINT_PAUSE
+            aligned = abs(self.last_yaw_err) < WAYPOINT_YAW_TOL
+            if waited and aligned:
+                self.waypoint_index = (self.waypoint_index + 1) % n
+                self.patrol_state = "CRUISE"
+                print(f"[NAV] Seguindo p/ waypoint {self.waypoint_index} "
+                      f"{WAYPOINTS[self.waypoint_index]}.")
 
     # -----------------------------------------------------------
     def run_vision(self):
@@ -395,12 +432,7 @@ class VigilanceDrone:
 
             # --- Etapa 1: controle + navegacao ---
             if MODE == "PATROL":
-                target = WAYPOINTS[self.waypoint_index]
-                distance = self.compute_motor_commands(target)
-                if distance < WAYPOINT_TOLERANCE:      # chegou -> proximo ponto
-                    self.waypoint_index = (self.waypoint_index + 1) % len(WAYPOINTS)
-                    print(f"[NAV] Waypoint {self.waypoint_index} -> "
-                          f"{WAYPOINTS[self.waypoint_index]}")
+                self.patrol_step()
             else:
                 self.compute_motor_commands()          # hover
 
