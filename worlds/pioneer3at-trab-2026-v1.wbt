@@ -312,8 +312,68 @@ DEF INTRUDER_2 Pedestrian {
 }
 
 # ======================= DRONE =======================
+# Anel de 8 sensores de distancia (a cada 45 deg) no bodySlot, para o
+# desvio reativo de paredes/obstaculos. lookupTable devolve metros (0..5).
 Mavic2Pro {
   translation -10 -10 0.1
   controller "drone_patrol"
   supervisor TRUE
+  bodySlot [
+    DistanceSensor {
+      name "ds0"
+      translation 0.25 0 0
+      rotation 0 0 1 0
+      lookupTable [ 0 0 0, 5 5 0 ]
+      type "generic"
+    }
+    DistanceSensor {
+      name "ds1"
+      translation 0.1768 0.1768 0
+      rotation 0 0 1 0.7854
+      lookupTable [ 0 0 0, 5 5 0 ]
+      type "generic"
+    }
+    DistanceSensor {
+      name "ds2"
+      translation 0 0.25 0
+      rotation 0 0 1 1.5708
+      lookupTable [ 0 0 0, 5 5 0 ]
+      type "generic"
+    }
+    DistanceSensor {
+      name "ds3"
+      translation -0.1768 0.1768 0
+      rotation 0 0 1 2.3562
+      lookupTable [ 0 0 0, 5 5 0 ]
+      type "generic"
+    }
+    DistanceSensor {
+      name "ds4"
+      translation -0.25 0 0
+      rotation 0 0 1 3.1416
+      lookupTable [ 0 0 0, 5 5 0 ]
+      type "generic"
+    }
+    DistanceSensor {
+      name "ds5"
+      translation -0.1768 -0.1768 0
+      rotation 0 0 1 3.9270
+      lookupTable [ 0 0 0, 5 5 0 ]
+      type "generic"
+    }
+    DistanceSensor {
+      name "ds6"
+      translation 0 -0.25 0
+      rotation 0 0 1 4.7124
+      lookupTable [ 0 0 0, 5 5 0 ]
+      type "generic"
+    }
+    DistanceSensor {
+      name "ds7"
+      translation 0.1768 -0.1768 0
+      rotation 0 0 1 5.4978
+      lookupTable [ 0 0 0, 5 5 0 ]
+      type "generic"
+    }
+  ]
 }

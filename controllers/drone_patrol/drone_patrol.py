@@ -53,6 +53,14 @@ MAX_POS_ERROR = 3.0          # satura o erro de posicao (evita tilt extremo)
 MAX_TILT_DISTURBANCE = 1.0    # limite de inclinacao por eixo (roll/pitch)
 MAX_YAW_DISTURBANCE = 1.3      # limite de giro por passo
 
+# Desvio reativo (campo potencial) com o anel de sensores de distancia.
+# Empurra o drone para longe de qualquer obstaculo dentro de REACT_RANGE,
+# mantendo pelo menos SAFE_DISTANCE de folga.
+SENSOR_COUNT = 8
+REACT_RANGE = 2.0            # m: comeca a repelir abaixo disto
+SAFE_DISTANCE = 0.5          # m: folga minima desejada de qualquer parede
+K_REPULSION = 2.0           # ganho da repulsao (forte perto de SAFE_DISTANCE)
+
 # Log de trajetoria na raiz do projeto (junto do telem.csv).
 # CWD do controlador = controllers/drone_patrol -> sobe 2 niveis.
 LOG_FILE_PATH = "../../log_trajetoria.txt"
@@ -282,6 +290,16 @@ class VigilanceDrone:
         self.cam_roll = self.robot.getDevice("camera roll")
         self.cam_pitch = self.robot.getDevice("camera pitch")
 
+        # anel de sensores de distancia (desvio reativo). ds{i} a i*45 deg
+        # no referencial do corpo (0 = frente, +CCW).
+        self.range_sensors = []
+        self.sensor_angles = []
+        for i in range(SENSOR_COUNT):
+            s = self.robot.getDevice(f"ds{i}")
+            s.enable(self.timestep)
+            self.range_sensors.append(s)
+            self.sensor_angles.append(i * 2.0 * math.pi / SENSOR_COUNT)
+
         # --- motores (helices em modo velocidade) ---
         self.motors = [self.robot.getDevice(n) for n in
                        ("front left propeller", "front right propeller",
@@ -322,6 +340,26 @@ class VigilanceDrone:
         self.inspect_anchor = None      # posicao travada durante o INSPECT
         self.last_register = 0.0        # ultimo registro continuo (FOLLOW)
         self.last_seen = 0.0            # ultima vez que viu a pessoa (FOLLOW)
+
+    # -----------------------------------------------------------
+    def _repulsion(self):
+        """Campo potencial repulsivo a partir do anel de sensores.
+        Retorna (a_fwd, a_left) no referencial do corpo e a menor leitura.
+        Cada sensor empurra na direcao oposta ao obstaculo que ve."""
+        rep_fwd = rep_left = 0.0
+        min_range = REACT_RANGE
+        for sensor, angle in zip(self.range_sensors, self.sensor_angles):
+            d = sensor.getValue()
+            if d < min_range:
+                min_range = d
+            if d >= REACT_RANGE:
+                continue
+            # mais forte perto de SAFE_DISTANCE; saturado abaixo dele
+            dd = max(d, SAFE_DISTANCE * 0.6)
+            mag = K_REPULSION * (1.0 / dd - 1.0 / REACT_RANGE)
+            rep_fwd -= mag * math.cos(angle)   # empurra p/ longe do sensor
+            rep_left -= mag * math.sin(angle)
+        return rep_fwd, rep_left, min_range
 
     # -----------------------------------------------------------
     def compute_motor_commands(self, target=None, face_point=None, target_alt=None):
@@ -376,6 +414,10 @@ class VigilanceDrone:
         # aceleracao desejada = P*erro - D*velocidade (freia o glide)
         a_fwd  = K_POS_P * e_fwd  - K_VEL_D * v_fwd
         a_left = K_POS_P * e_left - K_VEL_D * v_left
+        # desvio reativo: soma a repulsao dos sensores (seguranca)
+        rep_fwd, rep_left, min_range = self._repulsion()
+        a_fwd += rep_fwd
+        a_left += rep_left
         # frente = pitch negativo; esquerda = roll positivo (conv. Mavic)
         pitch_disturbance = -clamp(a_fwd, -MAX_TILT_DISTURBANCE, MAX_TILT_DISTURBANCE)
         roll_disturbance  =  clamp(a_left, -MAX_TILT_DISTURBANCE, MAX_TILT_DISTURBANCE)
@@ -431,6 +473,7 @@ class VigilanceDrone:
             "x": x, "y": y, "distance": distance,
             "vx": vx, "vy": vy, "v_fwd": v_fwd, "v_left": v_left,
             "pitch_dist": pitch_disturbance, "roll_dist": roll_disturbance,
+            "min_range": min_range,
             "fl": fl, "fr": fr, "rl": rl, "rr": rr,
         })
 
