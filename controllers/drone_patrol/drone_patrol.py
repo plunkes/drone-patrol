@@ -3,6 +3,7 @@ import math
 import json
 import socket
 import colorsys
+import heapq
 
 
 TARGET_ALTITUDE = 2.0          # setpoint de altitude para o hover (m)
@@ -39,6 +40,25 @@ WAYPOINTS = [
     (-12.0, 2.0, 6.0),
 ]
 WAYPOINT_TOLERANCE = 0.6       # dist (m) para considerar o waypoint alcancado
+SUBWP_TOLERANCE = 1.0          # dist (m) p/ avancar entre pontos do caminho A*
+
+# Mapa de obstaculos CONHECIDOS (nao inclui anomalias: cubos/pessoas).
+# Deve refletir o mundo. rects = (xmin,xmax,ymin,ymax); circles = (cx,cy,r).
+GRID_BOUNDS = (-16.0, 36.0, -14.0, 34.0)   # (xmin,xmax,ymin,ymax) do grid
+GRID_CELL = 1.0                            # tamanho da celula (m)
+OBSTACLE_INFLATE = 0.8                     # folga: raio do drone + margem
+STATIC_RECTS = [
+    (-0.3, 20.3, -0.3, 14.3),   # edificio (preenchido)
+    (22.0, 30.0, 4.0, 12.0),    # anexo
+    (23.0, 25.0, -7.0, -5.0),   # caixote
+]
+STATIC_CIRCLES = [
+    (16.0, -6.0, 0.5),          # arvore 1
+    (32.0, 12.0, 0.6),          # arvore 2
+    (-4.0, 20.0, 0.5),          # arvore 3
+    (6.0, 30.0, 0.5),           # arvore 4
+]
+
 # Parada + reorientacao em cada waypoint (freia -> gira p/ o proximo -> segue)
 WAYPOINT_ARRIVE_SPEED = 0.25   # m/s abaixo disso = "parado" no waypoint
 WAYPOINT_PAUSE = 1.5           # s de permanencia parado em cada waypoint
@@ -60,6 +80,7 @@ SENSOR_COUNT = 8
 REACT_RANGE = 2.0            # m: comeca a repelir abaixo disto
 SAFE_DISTANCE = 0.5          # m: folga minima desejada de qualquer parede
 K_REPULSION = 2.0           # ganho da repulsao (forte perto de SAFE_DISTANCE)
+REACT_MIN_ALT = 1.0         # m: so liga o desvio reativo acima desta altitude
 
 # Log de trajetoria na raiz do projeto (junto do telem.csv).
 # CWD do controlador = controllers/drone_patrol -> sobe 2 niveis.
@@ -177,6 +198,187 @@ class VisionDetector:
             else:
                 result[color] = {"area": 0, "u": 0, "v": 0}
         return result
+
+
+class Planner:
+    """Planejador DELIBERATIVO: Theta* (A* de "angulo livre") sobre um grid
+    de ocupacao dos obstaculos CONHECIDOS do mapa.
+
+    Por que Theta* e nao A* puro?
+      O A* classico so anda de celula em celula (8 direcoes), entao o
+      caminho sai "escadinha": muitos zigue-zagues de 45 deg que o drone
+      teria de seguir. O Theta* corrige isso: ao expandir um vizinho, ele
+      TENTA liga-lo direto ao AVO (o pai do no atual) em vez do pai.
+      Se existe linha de visada livre entre avo e vizinho, o caminho pula
+      o intermediario. O resultado sao poucos pontos e retas em qualquer
+      angulo -- muito melhor para um veiculo que voa livre no plano.
+
+    Camadas de navegacao:
+      - DELIBERATIVO (esta classe): planeja com o mapa conhecido, antes de
+        voar. Obstaculos estaticos (edificio, arvores, caixote).
+      - REATIVO (_repulsion no drone): sensores em tempo real, para o que
+        o mapa NAO sabe. As anomalias (cubos, pessoas) NAO entram aqui.
+
+    Representacao:
+      - Grid de ocupacao booleano `occ[linha][coluna]`, celula de `cell` m.
+      - Obstaculos descritos como retangulos e circulos em coords do mundo.
+      - Cada obstaculo e INFLADO por `inflate` (raio do drone + folga), de
+        modo que um caminho por celulas livres ja garante a distancia de
+        seguranca. E o truque padrao do "configuration space": infla o
+        obstaculo e trata o robo como um ponto.
+
+    Saida de plan(): lista de pontos (x, y) do mundo, do primeiro sub-alvo
+    ate o objetivo exato. O drone persegue um ponto de cada vez.
+    """
+
+    def __init__(self, bounds, cell, rects, circles, inflate):
+        self.xmin, self.xmax, self.ymin, self.ymax = bounds
+        self.cell = cell
+        self.cols = int((self.xmax - self.xmin) / cell) + 1
+        self.rows = int((self.ymax - self.ymin) / cell) + 1
+        # Pre-computa a ocupacao uma unica vez: o mapa e estatico, entao
+        # nao ha motivo para testar obstaculo a cada consulta do A*.
+        self.occ = [[self._blocked(*self._cw(c, r), rects, circles, inflate)
+                     for c in range(self.cols)] for r in range(self.rows)]
+
+    # --- conversoes celula <-> mundo ---
+    def _cw(self, c, r):
+        """Celula -> mundo (canto/centro logico da celula)."""
+        return (self.xmin + c * self.cell, self.ymin + r * self.cell)
+
+    def _wc(self, x, y):
+        """Mundo -> celula (arredonda p/ a celula mais proxima)."""
+        return (int(round((x - self.xmin) / self.cell)),
+                int(round((y - self.ymin) / self.cell)))
+
+    @staticmethod
+    def _blocked(x, y, rects, circles, inf):
+        """Ponto do mundo cai dentro de algum obstaculo JA INFLADO por
+        `inf`? Inflar aqui = garantir a folga sem checar o corpo do drone
+        depois (robo vira um ponto)."""
+        for x0, x1, y0, y1 in rects:
+            if x0 - inf <= x <= x1 + inf and y0 - inf <= y <= y1 + inf:
+                return True
+        for cx, cy, rad in circles:
+            if math.hypot(x - cx, y - cy) <= rad + inf:
+                return True
+        return False
+
+    def _free(self, c, r):
+        """Celula existe no grid e nao esta ocupada."""
+        return 0 <= c < self.cols and 0 <= r < self.rows and not self.occ[r][c]
+
+    def _nearest_free(self, c, r):
+        """Se start/goal caiu dentro da inflacao (ex.: waypoint colado num
+        muro), procura em aneis crescentes a celula livre mais proxima.
+        Sem isso o A* nao teria de onde partir / aonde chegar."""
+        if self._free(c, r):
+            return (c, r)
+        for rad in range(1, 15):
+            for dc in range(-rad, rad + 1):
+                for dr in range(-rad, rad + 1):
+                    if max(abs(dc), abs(dr)) == rad and self._free(c + dc, r + dr):
+                        return (c + dc, r + dr)
+        return (c, r)
+
+    def _los(self, a, b):
+        """LINHA DE VISADA -- o coracao do Theta*.
+        Percorre as celulas do segmento a->b com Bresenham. Se todas estao
+        livres, o drone pode voar reto de a ate b e o caminho pode cortar
+        o intermediario. Se alguma esta ocupada, nao ha visada."""
+        (c0, r0), (c1, r1) = a, b
+        dc, dr = abs(c1 - c0), abs(r1 - r0)
+        sc = 1 if c1 > c0 else -1
+        sr = 1 if r1 > r0 else -1
+        err = dc - dr
+        c, r = c0, r0
+        while True:
+            if not self._free(c, r):
+                return False
+            if (c, r) == (c1, r1):
+                return True
+            e2 = 2 * err
+            if e2 > -dr:
+                err -= dr
+                c += sc
+            if e2 < dc:
+                err += dc
+                r += sr
+
+    def _neighbors(self, node):
+        """Os 8 vizinhos livres (inclui diagonais)."""
+        c, r = node
+        for dc in (-1, 0, 1):
+            for dr in (-1, 0, 1):
+                if (dc or dr) and self._free(c + dc, r + dr):
+                    yield (c + dc, r + dr)
+
+    def _dist(self, a, b):
+        """Distancia euclidiana em metros. Serve de custo g E de heuristica
+        h (admissivel: nunca superestima, pois a reta e o menor caminho)."""
+        return math.hypot(a[0] - b[0], a[1] - b[1]) * self.cell
+
+    def plan(self, start, goal):
+        """Theta* de start ate goal (coords do mundo).
+
+        Estrutura A* padrao: fila de prioridade por f = g + h, onde
+          g[n] = custo real acumulado ate n
+          h[n] = distancia em linha reta de n ao objetivo (heuristica)
+        A diferenca do Theta* esta no relaxamento das arestas (abaixo).
+
+        Se nao existir rota, devolve [goal]: segue em linha reta e deixa a
+        camada reativa (sensores) resolver -- degradacao segura."""
+        s = self._nearest_free(*self._wc(*start))
+        g = self._nearest_free(*self._wc(*goal))
+
+        gscore = {s: 0.0}     # custo real conhecido ate cada no
+        parent = {s: s}       # de quem cada no veio (define o caminho)
+        openh = [(self._dist(s, g), s)]   # fila de prioridade por f
+        closed = set()        # nos ja expandidos (nao reabrir)
+
+        while openh:
+            _, cur = heapq.heappop(openh)
+            if cur == g:                  # objetivo alcancado
+                break
+            if cur in closed:             # entrada obsoleta do heap
+                continue
+            closed.add(cur)
+
+            for nb in self._neighbors(cur):
+                if nb in closed:
+                    continue
+                # --- relaxamento Theta* (o que o diferencia do A*) ---
+                # Tenta pendurar o vizinho direto no AVO (pai do atual).
+                # Se ha visada avo->vizinho, o caminho vira uma reta longa
+                # e o no atual e descartado como intermediario inutil.
+                p = parent[cur]
+                if self._los(p, nb):
+                    cand, ng = p, gscore[p] + self._dist(p, nb)
+                else:
+                    # sem visada: comporta-se como A* normal (via o atual)
+                    cand, ng = cur, gscore[cur] + self._dist(cur, nb)
+
+                # so aceita se for um caminho mais barato do que o conhecido
+                if nb not in gscore or ng < gscore[nb]:
+                    gscore[nb] = ng
+                    parent[nb] = cand
+                    heapq.heappush(openh, (ng + self._dist(nb, g), nb))
+
+        if g not in parent:
+            return [goal]                 # sem rota -> reta + camada reativa
+
+        # Refaz o caminho de tras p/ frente seguindo os pais. Como o Theta*
+        # ja "pulou" os intermediarios, sobram poucos pontos (os vertices).
+        path = [g]
+        while path[-1] != s:
+            path.append(parent[path[-1]])
+        path.reverse()
+
+        pts = [self._cw(c, r) for c, r in path]
+        pts[-1] = goal        # ultimo ponto = objetivo exato, nao o centro da celula
+        # Descarta o primeiro (celula onde o drone JA esta), senao ele
+        # tentaria voar de volta ao centro da propria celula.
+        return pts[1:] if len(pts) > 1 else pts
 
 
 class TrajectoryLogger:
@@ -315,6 +517,8 @@ class VigilanceDrone:
         self.vision = VisionDetector(self.camera)
         self.logger = TrajectoryLogger(LOG_FILE_PATH)
         self.anomalies = AnomalyRegister(ANOMALY_LOG_PATH)
+        self.planner = Planner(GRID_BOUNDS, GRID_CELL, STATIC_RECTS,
+                               STATIC_CIRCLES, OBSTACLE_INFLATE)
         self.keys = KeyboardListener(self.robot, self.timestep)
 
         self.target_yaw = None          # proa travada, definida no 1o passo
@@ -322,6 +526,8 @@ class VigilanceDrone:
         self.sim_time = 0.0
         self.waypoint_index = 0         # waypoint atual da rota (modo PATROL)
         self.patrol_state = "CRUISE"    # CRUISE -> PAUSE -> CRUISE
+        self.path = None                # caminho A* atual (lista de pontos xy)
+        self.path_idx = 0               # ponto do caminho sendo perseguido
         self.pause_start = 0.0          # instante em que comecou a parada
         self.last_speed = 0.0           # |v| horizontal (maquina de estados)
         self.last_yaw_err = 0.0         # erro de proa atual
@@ -342,12 +548,15 @@ class VigilanceDrone:
         self.last_seen = 0.0            # ultima vez que viu a pessoa (FOLLOW)
 
     # -----------------------------------------------------------
-    def _repulsion(self):
+    def _repulsion(self, altitude):
         """Campo potencial repulsivo a partir do anel de sensores.
         Retorna (a_fwd, a_left) no referencial do corpo e a menor leitura.
         Cada sensor empurra na direcao oposta ao obstaculo que ve."""
         rep_fwd = rep_left = 0.0
         min_range = REACT_RANGE
+        # so no ar: abaixo de REACT_MIN_ALT ignora os sensores (decolagem)
+        if altitude < REACT_MIN_ALT:
+            return rep_fwd, rep_left, min_range
         for sensor, angle in zip(self.range_sensors, self.sensor_angles):
             d = sensor.getValue()
             if d < min_range:
@@ -415,7 +624,7 @@ class VigilanceDrone:
         a_fwd  = K_POS_P * e_fwd  - K_VEL_D * v_fwd
         a_left = K_POS_P * e_left - K_VEL_D * v_left
         # desvio reativo: soma a repulsao dos sensores (seguranca)
-        rep_fwd, rep_left, min_range = self._repulsion()
+        rep_fwd, rep_left, min_range = self._repulsion(altitude)
         a_fwd += rep_fwd
         a_left += rep_left
         # frente = pitch negativo; esquerda = roll positivo (conv. Mavic)
@@ -482,7 +691,8 @@ class VigilanceDrone:
     # -----------------------------------------------------------
     def patrol_step(self):
         """Maquina de estados da patrulha.
-        CRUISE: voa ate o waypoint atual.
+        CRUISE: segue o caminho A* (Theta*) ate o waypoint, desviando dos
+                obstaculos conhecidos.
         PAUSE : chegou -> freia, gira para o proximo waypoint e espera
                 (WAYPOINT_PAUSE s alinhado) antes de seguir."""
         n = len(WAYPOINTS)
@@ -490,14 +700,27 @@ class VigilanceDrone:
         nxt = WAYPOINTS[(self.waypoint_index + 1) % n]
         cur_xy, cur_alt = (cur[0], cur[1]), cur[2]
         nxt_xy = (nxt[0], nxt[1])
+        x, y, _ = self.gps.getValues()
 
         if self.patrol_state == "CRUISE":
-            distance = self.compute_motor_commands(cur_xy, target_alt=cur_alt)
-            arrived = distance < WAYPOINT_TOLERANCE and self.last_speed < WAYPOINT_ARRIVE_SPEED
-            if arrived:
-                self.patrol_state = "PAUSE"
-                self.pause_start = self.sim_time
-                print(f"[NAV] Chegou ao waypoint {self.waypoint_index} {cur} -> parando.")
+            # planeja uma vez por trecho (obstaculos estaticos)
+            if self.path is None:
+                self.path = self.planner.plan((x, y), cur_xy)
+                self.path_idx = 0
+                print(f"[A*] Rota p/ waypoint {self.waypoint_index} {cur_xy}: "
+                      f"{len(self.path)} pontos.")
+            sub = self.path[self.path_idx]
+            dist_sub = self.compute_motor_commands(sub, target_alt=cur_alt)
+            if self.path_idx >= len(self.path) - 1:      # ultimo ponto = waypoint
+                arrived = (dist_sub < WAYPOINT_TOLERANCE and
+                           self.last_speed < WAYPOINT_ARRIVE_SPEED)
+                if arrived:
+                    self.patrol_state = "PAUSE"
+                    self.pause_start = self.sim_time
+                    self.path = None
+                    print(f"[NAV] Chegou ao waypoint {self.waypoint_index} {cur} -> parando.")
+            elif dist_sub < SUBWP_TOLERANCE:             # avanca no caminho
+                self.path_idx += 1
         else:  # PAUSE: segura a posicao no waypoint e encara o proximo
             self.compute_motor_commands(cur_xy, face_point=nxt_xy, target_alt=cur_alt)
             waited = self.sim_time - self.pause_start >= WAYPOINT_PAUSE
@@ -505,6 +728,7 @@ class VigilanceDrone:
             if waited and aligned:
                 self.waypoint_index = (self.waypoint_index + 1) % n
                 self.patrol_state = "CRUISE"
+                self.path = None                         # replaneja o proximo trecho
                 print(f"[NAV] Seguindo p/ waypoint {self.waypoint_index} "
                       f"{WAYPOINTS[self.waypoint_index]}.")
 
@@ -626,6 +850,7 @@ class VigilanceDrone:
         self.anomaly_cooldown[color] = self.sim_time
         self.mission = "PATROL"
         self.patrol_state = "CRUISE"
+        self.path = None                # replaneja a partir da posicao atual
         print(f"[MISSION] Retomando patrulha (cooldown {color} {ANOMALY_COOLDOWN:.0f}s).")
 
     # -----------------------------------------------------------
