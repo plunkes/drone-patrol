@@ -24,11 +24,19 @@ K_YAW_HOLD_D = 1.5           # amortece a rotacao (yaw rate)
 # MODE "PATROL" -> percorre a lista WAYPOINTS em loop
 MODE = "PATROL"
 
-# Rota (x, y) em coordenadas do mundo.
+# Rota (x, y, altitude) em coordenadas do mundo. Loop em torno do edificio,
+# com altitude variando por waypoint (movimento vertical).
 WAYPOINTS = [
-    (-22.0,  -22.0),
-    (5.0, -22.0),
-    (5.0, 0.0)
+    (-6.0, -10.0, 2.5),
+    (8.0, -10.0, 4.0),
+    (24.0, -10.0, 2.5),
+    (32.0, 2.0, 6.0),
+    (32.0, 18.0, 3.0),
+    (24.0, 30.0, 5.0),
+    (8.0, 30.0, 2.5),
+    (-6.0, 30.0, 4.0),
+    (-12.0, 18.0, 3.0),
+    (-12.0, 2.0, 6.0),
 ]
 WAYPOINT_TOLERANCE = 0.6       # dist (m) para considerar o waypoint alcancado
 # Parada + reorientacao em cada waypoint (freia -> gira p/ o proximo -> segue)
@@ -302,6 +310,7 @@ class VigilanceDrone:
         self.prev_alt = None            # altitude anterior (p/ estimar vz)
         self.prev_xy = None             # (x,y) anterior (p/ estimar vx,vy)
         self.hover_xy = None            # ponto de decolagem travado (HOVER)
+        self.target_alt = TARGET_ALTITUDE  # altitude alvo atual (por waypoint)
         self.debug_inputs = (0.0, 0.0, 0.0, 0.0)  # roll/pitch/yaw/vert p/ log
         self.telemetry = Telemetry(TELEMETRY_HOST, TELEMETRY_PORT,
                                    enable=TELEMETRY_ENABLE)
@@ -315,12 +324,15 @@ class VigilanceDrone:
         self.last_seen = 0.0            # ultima vez que viu a pessoa (FOLLOW)
 
     # -----------------------------------------------------------
-    def compute_motor_commands(self, target=None, face_point=None):
+    def compute_motor_commands(self, target=None, face_point=None, target_alt=None):
         """Roda o controle e aciona os 4 motores. Retorna a dist ao alvo.
 
         target=None      -> segura o ponto de decolagem (hover).
         target=(tx,ty)   -> vai ate o ponto.
-        face_point=(x,y) -> encara este ponto (senao encara o 'target')."""
+        face_point=(x,y) -> encara este ponto (senao encara o 'target').
+        target_alt       -> altitude alvo (m); None mantem a ultima."""
+        if target_alt is not None:
+            self.target_alt = target_alt
         roll, pitch, yaw = self.imu.getRollPitchYaw()
         roll_rate, pitch_rate, yaw_rate = self.gyro.getValues()
         x, y, altitude = self.gps.getValues()
@@ -382,7 +394,7 @@ class VigilanceDrone:
 
         # --- altitude: funcao cubica do erro saturado + amortecimento da
         #     taxa de subida (mata o overshoot/oscilacao na subida) ---
-        clamped_diff_alt = clamp(TARGET_ALTITUDE - altitude + K_VERTICAL_OFFSET,
+        clamped_diff_alt = clamp(self.target_alt - altitude + K_VERTICAL_OFFSET,
                                  -1.0, 1.0)
         vertical_input = K_VERTICAL_P * (clamped_diff_alt ** 3) - K_VERTICAL_D * vz
 
@@ -410,7 +422,7 @@ class VigilanceDrone:
         # snapshot completo p/ telemetria/plotter
         self.telemetry.send({
             "t": round(self.sim_time, 3),
-            "altitude": altitude, "target_altitude": TARGET_ALTITUDE, "vz": vz,
+            "altitude": altitude, "target_altitude": self.target_alt, "vz": vz,
             "roll": roll, "pitch": pitch, "yaw": yaw,
             "yaw_err": yaw_err, "desired_yaw": desired_yaw,
             "roll_rate": roll_rate, "pitch_rate": pitch_rate, "yaw_rate": yaw_rate,
@@ -433,16 +445,18 @@ class VigilanceDrone:
         n = len(WAYPOINTS)
         cur = WAYPOINTS[self.waypoint_index]
         nxt = WAYPOINTS[(self.waypoint_index + 1) % n]
+        cur_xy, cur_alt = (cur[0], cur[1]), cur[2]
+        nxt_xy = (nxt[0], nxt[1])
 
         if self.patrol_state == "CRUISE":
-            distance = self.compute_motor_commands(cur)
+            distance = self.compute_motor_commands(cur_xy, target_alt=cur_alt)
             arrived = distance < WAYPOINT_TOLERANCE and self.last_speed < WAYPOINT_ARRIVE_SPEED
             if arrived:
                 self.patrol_state = "PAUSE"
                 self.pause_start = self.sim_time
                 print(f"[NAV] Chegou ao waypoint {self.waypoint_index} {cur} -> parando.")
         else:  # PAUSE: segura a posicao no waypoint e encara o proximo
-            self.compute_motor_commands(cur, face_point=nxt)
+            self.compute_motor_commands(cur_xy, face_point=nxt_xy, target_alt=cur_alt)
             waited = self.sim_time - self.pause_start >= WAYPOINT_PAUSE
             aligned = abs(self.last_yaw_err) < WAYPOINT_YAW_TOL
             if waited and aligned:
