@@ -125,6 +125,14 @@ ANOMALY_LOG_PATH = "../../anomalias.txt"
 APPROACH_RANGE = 10.0         # m: distancia maxima p/ registrar a anomalia
 APPROACH_TIMEOUT = 25.0       # s max tentando aproximar
 APPROACH_LOST_TIMEOUT = 3.0   # s sem ver o alvo -> desiste
+FOLLOW_STANDOFF = 5.0         # m: distancia mantida da pessoa no follow
+
+# Perseguicao de anomalia tambem usa o planejador (A*), nao reta cega:
+# o alvo nao esta no mapa, mas os OBSTACULOS estao -- entao planejamos
+# ate o alvo estimado desviando do que e conhecido, e a camada reativa
+# fica so como rede de seguranca.
+NAV_REPLAN_PERIOD = 1.0       # s entre replanejamentos (alvo se move)
+NAV_REPLAN_DIST = 2.0         # m: alvo mudou tanto -> replaneja ja
 
 # Camera apontada p/ baixo (rad). Sem isto a camera olha no horizonte e nao
 # enxerga anomalias no chao. Tambem e o angulo usado na telemetria de alcance.
@@ -259,12 +267,17 @@ class Planner:
     def __init__(self, bounds, cell, rects, circles, inflate):
         self.xmin, self.xmax, self.ymin, self.ymax = bounds
         self.cell = cell
+        self.rects, self.circles, self.inflate = rects, circles, inflate
         self.cols = int((self.xmax - self.xmin) / cell) + 1
         self.rows = int((self.ymax - self.ymin) / cell) + 1
         # Pre-computa a ocupacao uma unica vez: o mapa e estatico, entao
         # nao ha motivo para testar obstaculo a cada consulta do A*.
         self.occ = [[self._blocked(*self._cw(c, r), rects, circles, inflate)
                      for c in range(self.cols)] for r in range(self.rows)]
+
+    def is_blocked(self, x, y):
+        """Ponto do mundo cai dentro de um obstaculo inflado?"""
+        return self._blocked(x, y, self.rects, self.circles, self.inflate)
 
     # --- conversoes celula <-> mundo ---
     def _cw(self, c, r):
@@ -400,7 +413,10 @@ class Planner:
         path.reverse()
 
         pts = [self._cw(c, r) for c, r in path]
-        pts[-1] = goal        # ultimo ponto = objetivo exato, nao o centro da celula
+        # Ultimo ponto = objetivo exato -- MAS so se ele estiver livre. Uma
+        # anomalia pode estar encostada num muro; nesse caso paramos na
+        # celula livre mais proxima em vez de voar para dentro do muro.
+        pts[-1] = goal if not self.is_blocked(*goal) else self._cw(*g)
         # Descarta o primeiro (celula onde o drone JA esta), senao ele
         # tentaria voar de volta ao centro da propria celula.
         return pts[1:] if len(pts) > 1 else pts
@@ -571,6 +587,11 @@ class VigilanceDrone:
         self.state_start = 0.0          # inicio do estado INSPECT/FOLLOW
         self.inspect_anchor = None      # posicao travada durante o INSPECT
         self.approach_kind = None       # tipo de anomalia sendo aproximada
+        self.target_est = None          # ultima posicao (x,y) estimada do alvo
+        self.nav_path = None            # caminho A* ate o alvo (APPROACH/FOLLOW)
+        self.nav_idx = 0
+        self.nav_goal = None
+        self.nav_replan_t = -1e9
         self.last_register = 0.0        # ultimo registro continuo (FOLLOW)
         self.last_seen = 0.0            # ultima vez que viu a pessoa (FOLLOW)
 
@@ -821,6 +842,8 @@ class VigilanceDrone:
             self.approach_kind = trig
             self.state_start = self.sim_time
             self.last_seen = self.sim_time
+            self.target_est = None
+            self._reset_nav()
             label = "Pessoa" if trig == "green" else "Cubo vermelho"
             print(f"[MISSION] {label} detectado -> aproximando "
                   f"(ate {APPROACH_RANGE:.0f} m).")
@@ -832,20 +855,60 @@ class VigilanceDrone:
         elif self.mission == "FOLLOW":
             self._follow_step(det, x, y, z, yaw)
 
+    def _reset_nav(self):
+        """Descarta o caminho A* de perseguicao (forca replanejamento)."""
+        self.nav_path = None
+        self.nav_goal = None
+        self.nav_idx = 0
+        self.nav_replan_t = -1e9
+
+    def _standoff_goal(self, x, y, target_xy, standoff):
+        """Ponto na reta drone->alvo, a `standoff` metros do alvo.
+        Nunca mandamos o drone para cima da anomalia: paramos antes."""
+        tx, ty = target_xy
+        dx, dy = tx - x, ty - y
+        d = math.hypot(dx, dy)
+        if d <= standoff:
+            return (x, y)                      # ja esta perto: segura
+        f = (d - standoff) / d
+        return (x + dx * f, y + dy * f)
+
+    def _navigate_to(self, x, y, goal, face_point):
+        """Planeja (com cache) e segue um caminho A* ate `goal`, encarando
+        `face_point`. E aqui que o DELIBERATIVO entra na perseguicao: o
+        alvo nao esta no mapa, mas os obstaculos estao, entao o drone
+        contorna o edificio/arvores em vez de ir em linha reta."""
+        moved = (self.nav_goal is None or
+                 math.hypot(goal[0] - self.nav_goal[0],
+                            goal[1] - self.nav_goal[1]) > NAV_REPLAN_DIST)
+        stale = self.sim_time - self.nav_replan_t > NAV_REPLAN_PERIOD
+        if self.nav_path is None or moved or stale:
+            self.nav_path = self.planner.plan((x, y), goal)
+            self.nav_idx = 0
+            self.nav_goal = goal
+            self.nav_replan_t = self.sim_time
+
+        sub = self.nav_path[min(self.nav_idx, len(self.nav_path) - 1)]
+        d_sub = self.compute_motor_commands(target=sub, face_point=face_point)
+        if self.nav_idx < len(self.nav_path) - 1 and d_sub < SUBWP_TOLERANCE:
+            self.nav_idx += 1
+
     def _approach_step(self, det, x, y, z, yaw):
-        """Voa em direcao a anomalia ate ficar a <= APPROACH_RANGE dela.
-        So entao passa p/ INSPECT (cubo) ou FOLLOW (pessoa)."""
+        """Voa em direcao a anomalia ate ficar a <= APPROACH_RANGE dela,
+        DESVIANDO dos obstaculos conhecidos (A*). So entao passa p/
+        INSPECT (cubo) ou FOLLOW (pessoa)."""
         kind = self.approach_kind
         info = det.get(kind) if det else None
         seen = info and info["area"] >= MIN_BLOB_AREA
 
         if seen:
             self.last_seen = self.sim_time
+            world, rng = self._estimate_pos(info, x, y, z, yaw, kind)
+            self.target_est = (world[0], world[1])   # memoriza p/ nao perder
             face = self._bearing_point(info, x, y, yaw)
-            rng = self._range_to_target(info, z, kind)
             if rng is not None and rng <= APPROACH_RANGE:
-                # chegou perto o bastante -> comportamento por tipo
                 self.state_start = self.sim_time
+                self._reset_nav()
                 if kind == "red":
                     self.mission = "INSPECT"
                     self.inspect_anchor = (x, y)
@@ -856,11 +919,16 @@ class VigilanceDrone:
                     print(f"[MISSION] A {rng:.1f} m da pessoa -> seguindo.")
                 self.compute_motor_commands(target=(x, y), face_point=face)
                 return
-            # ainda longe: persegue a posicao estimada do alvo
-            world, _ = self._estimate_pos(info, x, y, z, yaw, kind)
-            self.compute_motor_commands(target=(world[0], world[1]), face_point=face)
+        elif self.target_est is not None:
+            face = self.target_est          # sumiu de vista: mira o ultimo visto
         else:
-            self.compute_motor_commands(target=(x, y))   # perdeu: segura
+            self.compute_motor_commands(target=(x, y))
+            face = None
+
+        if self.target_est is not None:
+            # objetivo = ponto a APPROACH_RANGE do alvo, alcancado via A*
+            goal = self._standoff_goal(x, y, self.target_est, APPROACH_RANGE * 0.9)
+            self._navigate_to(x, y, goal, face)
 
         elapsed = self.sim_time - self.state_start
         lost = self.sim_time - self.last_seen > APPROACH_LOST_TIMEOUT
@@ -904,22 +972,28 @@ class VigilanceDrone:
             self._resume_patrol("red")
 
     def _follow_step(self, det, x, y, z, yaw):
-        """Pessoa: aproxima e segue ate 10s (ou ate perde-la), registrando."""
+        """Pessoa: segue por ate 10s mantendo FOLLOW_STANDOFF, registrando
+        continuamente. O trajeto tambem passa pelo A* -> contorna
+        obstaculos em vez de arrastar o drone contra uma parede."""
         info = det.get("green") if det else None
         seen = info and info["area"] >= MIN_BLOB_AREA
+        face = None
         if seen:
             self.last_seen = self.sim_time
+            world, rng = self._estimate_pos(info, x, y, z, yaw, "green")
+            self.target_est = (world[0], world[1])
             face = self._bearing_point(info, x, y, yaw)
-            b = self._bearing(info, yaw)
-            tgt = (x + FOLLOW_APPROACH * math.cos(b),
-                   y + FOLLOW_APPROACH * math.sin(b))
-            self.compute_motor_commands(target=tgt, face_point=face)
             if self.sim_time - self.last_register >= REGISTER_PERIOD:
                 self.last_register = self.sim_time
-                world, rng = self._estimate_pos(info, x, y, z, yaw, "green")
                 self.anomalies.register(self.sim_time, "green", world, (x, y, z, yaw), rng)
+        elif self.target_est is not None:
+            face = self.target_est          # sumiu: mira o ultimo visto
+
+        if self.target_est is not None:
+            goal = self._standoff_goal(x, y, self.target_est, FOLLOW_STANDOFF)
+            self._navigate_to(x, y, goal, face)
         else:
-            self.compute_motor_commands(target=(x, y))   # perdeu: segura no lugar
+            self.compute_motor_commands(target=(x, y))   # nada a seguir: segura
 
         elapsed = self.sim_time - self.state_start
         lost = self.sim_time - self.last_seen > FOLLOW_LOST_TIMEOUT
@@ -933,6 +1007,8 @@ class VigilanceDrone:
         self.mission = "PATROL"
         self.patrol_state = "CRUISE"
         self.path = None                # replaneja a partir da posicao atual
+        self.target_est = None
+        self._reset_nav()
         print(f"[MISSION] Retomando patrulha (cooldown {color} {ANOMALY_COOLDOWN:.0f}s).")
 
     # -----------------------------------------------------------
