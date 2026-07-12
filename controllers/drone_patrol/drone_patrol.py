@@ -60,6 +60,17 @@ MIN_BLOB_AREA = 40
 VISION_STRIDE = 2              # amostra 1 a cada N pixels (performance)
 ALERT_COOLDOWN = 3.0           # s entre alertas repetidos do mesmo alvo
 
+# Tratamento de anomalias (cubo vermelho / pessoa verde).
+ANOMALY_COOLDOWN = 30.0       # s antes de reagir de novo ao mesmo tipo
+INSPECT_TIMEOUT = 8.0         # s max encarando o cubo antes de desistir
+INSPECT_CENTER_TOL = 0.10     # rad: cubo centrado -> registra
+FOLLOW_DURATION = 10.0        # s seguindo a pessoa
+FOLLOW_LOST_TIMEOUT = 3.0     # s sem ver a pessoa -> considera perdida
+FOLLOW_APPROACH = 2.0         # m a frente: alvo de aproximacao no follow
+REGISTER_PERIOD = 1.0        # s entre registros continuos (follow)
+REGISTER_NOMINAL_RANGE = 3.0  # m: standoff estimado quando nao ha profundidade
+ANOMALY_LOG_PATH = "../../anomalias.txt"
+
 # Deteccao de cor em HSV (robusta a sombra/contraluz).  O matiz (hue) se
 # mantem sob variacao de luz; satura/valor rejeitam cinza e preto.
 HUE_RED_LOW = 15.0            # vermelho: hue <= 15 ou >= 345 graus
@@ -169,6 +180,39 @@ class TrajectoryLogger:
             print(f"[I/O] Log salvo em '{self.path}'.")
 
 
+class AnomalyRegister:
+    """Registra anomalias detectadas (a "foto"): tempo, tipo, posicao
+    estimada no mundo e pose do drone. Grava em arquivo e no console."""
+
+    def __init__(self, path):
+        self.path = path
+        self._f = open(path, "w")
+        self._f.write("# t tipo  wx wy wz  drone_x drone_y drone_z  yaw_deg range_m\n")
+
+    def register(self, t, kind, world, drone_pose, rng, announce=True):
+        wx, wy, wz = world
+        dx, dy, dz, yaw = drone_pose
+        rng_s = f"{rng:.2f}" if rng is not None else "NA"
+        self._f.write(f"{t:.2f} {kind} {wx:.3f} {wy:.3f} {wz:.3f} "
+                      f"{dx:.3f} {dy:.3f} {dz:.3f} {math.degrees(yaw):.1f} {rng_s}\n")
+        self._f.flush()
+        if announce:
+            label = "CUBO VERMELHO" if kind == "red" else "PESSOA"
+            print("=" * 60)
+            print(f"[ANOMALIA] {label} registrada (t={t:.1f}s)")
+            print(f"    Posicao estimada : x={wx:.2f} y={wy:.2f} z={wz:.2f}"
+                  f"  (range={rng_s} m)")
+            print(f"    Observado de     : x={dx:.2f} y={dy:.2f} z={dz:.2f}"
+                  f"  yaw={math.degrees(yaw):+.1f} deg")
+            print("=" * 60)
+
+    def close(self):
+        if self._f and not self._f.closed:
+            self._f.flush()
+            self._f.close()
+            print(f"[I/O] Anomalias salvas em '{self.path}'.")
+
+
 class Telemetry:
     """Envia o estado de controle por UDP (JSON) p/ um plotter externo.
 
@@ -238,9 +282,13 @@ class VigilanceDrone:
             m.setPosition(float("inf"))
             m.setVelocity(1.0)
 
+        self.cam_width = self.camera.getWidth()
+        self.cam_fov = self.camera.getFov()   # FOV horizontal (rad)
+
         # --- modulos ---
         self.vision = VisionDetector(self.camera)
         self.logger = TrajectoryLogger(LOG_FILE_PATH)
+        self.anomalies = AnomalyRegister(ANOMALY_LOG_PATH)
         self.keys = KeyboardListener(self.robot, self.timestep)
 
         self.target_yaw = None          # proa travada, definida no 1o passo
@@ -257,6 +305,14 @@ class VigilanceDrone:
         self.debug_inputs = (0.0, 0.0, 0.0, 0.0)  # roll/pitch/yaw/vert p/ log
         self.telemetry = Telemetry(TELEMETRY_HOST, TELEMETRY_PORT,
                                    enable=TELEMETRY_ENABLE)
+
+        # --- mission FSM: PATROL / INSPECT (cubo) / FOLLOW (pessoa) ---
+        self.mission = "PATROL"
+        self.anomaly_cooldown = {"red": -1e9, "green": -1e9}
+        self.state_start = 0.0          # inicio do estado INSPECT/FOLLOW
+        self.inspect_anchor = None      # posicao travada durante o INSPECT
+        self.last_register = 0.0        # ultimo registro continuo (FOLLOW)
+        self.last_seen = 0.0            # ultima vez que viu a pessoa (FOLLOW)
 
     # -----------------------------------------------------------
     def compute_motor_commands(self, target=None, face_point=None):
@@ -396,28 +452,140 @@ class VigilanceDrone:
                       f"{WAYPOINTS[self.waypoint_index]}.")
 
     # -----------------------------------------------------------
-    def run_vision(self):
-        """Etapa 2: processa a imagem e emite ALERTA MONITORAMENTO."""
-        det = self.vision.scan()
+    # Localizacao do alvo a partir da imagem
+    def _bearing(self, info, yaw):
+        """Azimute (mundo) do alvo a partir do deslocamento em u na imagem."""
+        offset = (info["u"] / self.cam_width - 0.5) * self.cam_fov
+        return normalize_angle(yaw - offset)
+
+    def _bearing_point(self, info, x, y, yaw):
+        """Ponto distante na direcao do alvo (usado como face_point)."""
+        b = self._bearing(info, yaw)
+        return (x + 50.0 * math.cos(b), y + 50.0 * math.sin(b))
+
+    def _estimate_pos(self, info, x, y, z, yaw):
+        """Posicao estimada do alvo no mundo e range (m).
+        Usa a posicao relativa da Recognition; senao projeta a bearing
+        a um standoff nominal (localizacao so por bearing)."""
+        rel = info.get("rel") if info else None
+        if rel is not None:
+            rx, ry, rz = rel
+            fwd, right = -rz, rx      # camera olha em -z; x = direita
+            wx = x + fwd * math.cos(yaw) + right * math.sin(yaw)
+            wy = y + fwd * math.sin(yaw) - right * math.cos(yaw)
+            return (wx, wy, z + ry), math.hypot(fwd, right)
+        b = self._bearing(info, yaw)
+        d = REGISTER_NOMINAL_RANGE
+        return (x + d * math.cos(b), y + d * math.sin(b), 0.0), None
+
+    # Mission FSM
+    def mission_step(self, det):
+        """Despacha PATROL / INSPECT (cubo) / FOLLOW (pessoa)."""
+        x, y, z = self.gps.getValues()
+        _, _, yaw = self.imu.getRollPitchYaw()
+
+        if self.mission == "PATROL":
+            trig = self._check_trigger(det)
+            if trig == "green":
+                self.mission = "FOLLOW"
+                self.state_start = self.sim_time
+                self.last_seen = self.sim_time
+                self.last_register = -1e9
+                print("[MISSION] Pessoa detectada -> seguindo.")
+            elif trig == "red":
+                self.mission = "INSPECT"
+                self.state_start = self.sim_time
+                self.inspect_anchor = (x, y)
+                print("[MISSION] Cubo vermelho detectado -> inspecionando.")
+            else:
+                self.patrol_step()
+                return
+
+        if self.mission == "INSPECT":
+            self._inspect_step(det, x, y, z, yaw)
+        elif self.mission == "FOLLOW":
+            self._follow_step(det, x, y, z, yaw)
+
+    def _check_trigger(self, det):
+        """Retorna 'green'/'red' se ha anomalia acima do limiar e fora do
+        cooldown (pessoa tem prioridade); senao None."""
+        if det is None:
+            return None
+        for color in ("green", "red"):
+            info = det.get(color)
+            if (info and info["area"] >= MIN_BLOB_AREA and
+                    self.sim_time - self.anomaly_cooldown[color] >= ANOMALY_COOLDOWN):
+                return color
+        return None
+
+    def _inspect_step(self, det, x, y, z, yaw):
+        """Cubo: para, encara, registra a "foto", retoma."""
+        info = det.get("red") if det else None
+        seen = info and info["area"] >= MIN_BLOB_AREA
+        if seen:
+            face = self._bearing_point(info, x, y, yaw)
+            self.compute_motor_commands(target=self.inspect_anchor, face_point=face)
+            if abs(self.last_yaw_err) < INSPECT_CENTER_TOL:      # centrado
+                world, rng = self._estimate_pos(info, x, y, z, yaw)
+                self.anomalies.register(self.sim_time, "red", world, (x, y, z, yaw), rng)
+                self._resume_patrol("red")
+                return
+        else:
+            self.compute_motor_commands(target=self.inspect_anchor)
+
+        if self.sim_time - self.state_start > INSPECT_TIMEOUT:
+            world, rng = (self._estimate_pos(info, x, y, z, yaw)
+                          if seen else ((x, y, 0.0), None))
+            self.anomalies.register(self.sim_time, "red", world, (x, y, z, yaw), rng)
+            print("[MISSION] Inspecao esgotou o tempo -> registrando e seguindo.")
+            self._resume_patrol("red")
+
+    def _follow_step(self, det, x, y, z, yaw):
+        """Pessoa: aproxima e segue ate 10s (ou ate perde-la), registrando."""
+        info = det.get("green") if det else None
+        seen = info and info["area"] >= MIN_BLOB_AREA
+        if seen:
+            self.last_seen = self.sim_time
+            face = self._bearing_point(info, x, y, yaw)
+            b = self._bearing(info, yaw)
+            tgt = (x + FOLLOW_APPROACH * math.cos(b),
+                   y + FOLLOW_APPROACH * math.sin(b))
+            self.compute_motor_commands(target=tgt, face_point=face)
+            if self.sim_time - self.last_register >= REGISTER_PERIOD:
+                self.last_register = self.sim_time
+                world, rng = self._estimate_pos(info, x, y, z, yaw)
+                self.anomalies.register(self.sim_time, "green", world, (x, y, z, yaw), rng)
+        else:
+            self.compute_motor_commands(target=(x, y))   # perdeu: segura no lugar
+
+        elapsed = self.sim_time - self.state_start
+        lost = self.sim_time - self.last_seen > FOLLOW_LOST_TIMEOUT
+        if elapsed >= FOLLOW_DURATION or lost:
+            reason = "10s concluidos" if elapsed >= FOLLOW_DURATION else "pessoa perdida"
+            print(f"[MISSION] Follow encerrado ({reason}).")
+            self._resume_patrol("green")
+
+    def _resume_patrol(self, color):
+        self.anomaly_cooldown[color] = self.sim_time
+        self.mission = "PATROL"
+        self.patrol_state = "CRUISE"
+        print(f"[MISSION] Retomando patrulha (cooldown {color} {ANOMALY_COOLDOWN:.0f}s).")
+
+    # -----------------------------------------------------------
+    def run_vision(self, det):
+        """Alerta simples de monitoramento (usado no modo HOVER)."""
         if det is None:
             return
         _, _, yaw = self.imu.getRollPitchYaw()
         x, y, z = self.gps.getValues()
-
-        labels = {"red": "Objeto suspeito (vermelho)",
-                  "green": "INTRUSO (pedestre)"}
+        labels = {"red": "Objeto suspeito (vermelho)", "green": "INTRUSO (pedestre)"}
         for color in ("green", "red"):
             info = det[color]
-            if info["area"] >= MIN_BLOB_AREA:
-                if self.sim_time - self.last_alert[color] >= ALERT_COOLDOWN:
-                    self.last_alert[color] = self.sim_time
-                    print("=" * 60)
-                    print(f"[ALERTA MONITORAMENTO] {labels[color]} detectado!")
-                    print(f"    Area do blob : {info['area']} px  "
-                          f"@ imagem(u={info['u']:.0f}, v={info['v']:.0f})")
-                    print(f"    Posicao GPS  : x={x:.2f}  y={y:.2f}  z={z:.2f}")
-                    print(f"    Orientacao   : yaw={math.degrees(yaw):+.1f} deg")
-                    print("=" * 60)
+            if info["area"] >= MIN_BLOB_AREA and \
+                    self.sim_time - self.last_alert[color] >= ALERT_COOLDOWN:
+                self.last_alert[color] = self.sim_time
+                print(f"[ALERTA] {labels[color]} @ img(u={info['u']:.0f},v={info['v']:.0f}) "
+                      f"| GPS x={x:.2f} y={y:.2f} z={z:.2f} yaw={math.degrees(yaw):+.1f}")
 
     # -----------------------------------------------------------
     def run(self):
@@ -430,21 +598,15 @@ class VigilanceDrone:
             self.sim_time += self.dt
             step += 1
 
-            # --- Etapa 1: controle + navegacao ---
+            # --- Etapa 2: visao (uma varredura por passo) ---
+            det = self.vision.scan()
+
+            # --- Etapa 1: controle + navegacao + anomalias ---
             if MODE == "PATROL":
-                self.patrol_step()
+                self.mission_step(det)
             else:
                 self.compute_motor_commands()          # hover
-
-            # --- Etapa 1: debug do controle no console ---
-            if step % log_every == 0:
-                ri, pi, yi, vi = self.debug_inputs
-                _, _, alt = self.gps.getValues()
-                # print(f"[CTRL] alt={alt:+.2f} | roll_in={ri:+.2f} | "
-                      # f"pitch_in={pi:+.2f} | yaw_in={yi:+.2f} | vert_in={vi:+.2f}")
-
-            # --- Etapa 2: visao ---
-            self.run_vision()
+                self.run_vision(det)
 
             # --- Etapa 3: log de trajetoria ---
             x, y, z = self.gps.getValues()
@@ -458,6 +620,7 @@ class VigilanceDrone:
         # fecha o arquivo com seguranca (flush + close).
         # Ao retornar de run(), o controlador termina e a simulacao para.
         self.logger.close()
+        self.anomalies.close()
         self.telemetry.close()
 
 
